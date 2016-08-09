@@ -36,14 +36,23 @@ const eslint = new ESLintCLIEngine();
  * @param  {Object} payload         the payload sent by Github
  * @return {Array} the commits pushed to Github
  */
-const getCommitsFromPayload = payload => payload.commits;
+const getCommitsForPullRequest = ({number}, callback) => github.pullRequests.getCommits({
+    user: REPOSITORY_OWNER,
+    repo: REPOSITORY_NAME,
+    number
+}, (error, commits) => {
+    if (error) {
+        console.log(error);
+    }
+    callback(commits);
+});
 
 /**
  * Get modified files from a commit.
  * @param  {Function} callback      callback called when the files are fetched
  * @param  {Object}   {id}          the commit object
  */
-const getFilesFromCommit = (callback, {id: sha}) => {
+const getFilesFromCommit = (callback, {sha}) => {
     github.repos.getCommit({
         user: REPOSITORY_OWNER,
         repo: REPOSITORY_NAME,
@@ -65,13 +74,14 @@ const filterJavascriptFiles = files => files.filter(({filename}) => filename.mat
 
 /**
  * Download a file from its url, then call the callback with its content.
+ * @param  {Number}   number            Pull request number
  * @param  {Function} callback          Download success callback
  * @param  {String}   filename          File filename
  * @param  {String}   patch             The commit's patch string.
  * @param  {String}   raw_url           File URL
  * @param  {String}   sha               Commit id
  */
-const downloadFile = (callback, {filename, patch, raw_url}, sha) => { // eslint-disable-line
+const downloadFile = (callback, {number}, {filename, patch, raw_url}, sha) => { // eslint-disable-line
     github.repos.getContent({
         user: REPOSITORY_OWNER,
         repo: REPOSITORY_NAME,
@@ -81,7 +91,7 @@ const downloadFile = (callback, {filename, patch, raw_url}, sha) => { // eslint-
         if (error) {
             console.log(error);
         }else{
-            callback(filename, patch, atob(data.content), sha);
+            callback(number, filename, patch, atob(data.content), sha);
         }
     });
 };
@@ -115,18 +125,20 @@ const getLineMapFromPatchString = patchString => {
 
 /**
  * Lint a raw content passed as a string, then return the linting messages.
+ * @param  {Number} number   Pull request number
  * @param  {String} filename File filename
  * @param  {String} patch    Commit's Git patch
  * @param  {String} content  File content
  * @param  {String} sha      Commit's id
  * @return {Array}  Linting messages
  */
-const lintContent = (filename, patch, content, sha) => {
-    return {filename, lineMap: getLineMapFromPatchString(patch), messages: _.get(eslint.executeOnText(content, filename), 'results[0].messages'), sha};
+const lintContent = (number, filename, patch, content, sha) => {
+    return {number, filename, lineMap: getLineMapFromPatchString(patch), messages: _.get(eslint.executeOnText(content, filename), 'results[0].messages'), sha};
 };
 
 /**
  * Send a comment to Github's commit view
+ * @param  {Number} number   Pull request number
  * @param  {String} filename File filename
  * @param  {Object} lineMap  The map between file and diff view line numbers
  * @param  {String} ruleId ESLint rule id
@@ -134,12 +146,13 @@ const lintContent = (filename, patch, content, sha) => {
  * @param  {Integer} line  Line number (in the file)
  * @param  {String} sha      Commit's id
  */
-const sendSingleComment = (filename, lineMap, {ruleId='Eslint', message, line}, sha) => {
+const sendSingleComment = (number, filename, lineMap, {ruleId='Eslint', message, line}, sha) => {
     const diffLinePosition = lineMap[line];
     if (diffLinePosition) { // By testing this, we skip the linting messages related to non-modified lines.
-        github.repos.createCommitComment({
+        github.pullRequests.createComment({
             user: REPOSITORY_OWNER,
             repo: REPOSITORY_NAME,
+            number,
             sha,
             path: filename,
             commit_id: sha, // eslint-disable-line
@@ -151,13 +164,14 @@ const sendSingleComment = (filename, lineMap, {ruleId='Eslint', message, line}, 
 
 /**
  * Send the comments for all the linting messages, to Github
+ * @param  {Number} number   Pull request number
  * @param  {String} filename File filename
  * @param  {Object} lineMap  The map between file and diff view line numbers
  * @param  {Array} messages  ESLint messages
  * @param  {String} sha      Commit's id
  */
-const sendComments = ({filename, lineMap, messages, sha}) => {
-    messages.map(message => sendSingleComment(filename, lineMap, message, sha));
+const sendComments = ({number, filename, lineMap, messages, sha}) => {
+    messages.map(message => sendSingleComment(number, filename, lineMap, message, sha));
 };
 
 /**
@@ -167,12 +181,14 @@ const sendComments = ({filename, lineMap, messages, sha}) => {
  * @param  {Object} payload Push event's payload sent by Github.
  */
 const treatPayload = payload => {
-    getCommitsFromPayload(payload).map(commit => {
-        getFilesFromCommit((files, sha) => {
-            filterJavascriptFiles(files).map(file => {
-                downloadFile(_.compose(sendComments, lintContent), file, sha);
-            });
-        }, commit);
+    getCommitsForPullRequest(payload.pull_request, commits => {
+        commits.map(commit =>
+            getFilesFromCommit((files, sha) => {
+                filterJavascriptFiles(files).map(file => {
+                    downloadFile(_.compose(sendComments, lintContent), payload.pull_request, file, sha);
+                });
+            }, commit)
+        );
     });
 };
 
@@ -183,7 +199,7 @@ app.use(bodyParser.json());
 app.set('port', (process.env.PORT || 5000));
 
 app.post('/', ({body: payload}, response) => {
-    if (payload && payload.commits) {
+    if (payload && payload.pull_request) {
         treatPayload(payload);
     }
     response.end();
